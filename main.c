@@ -9,11 +9,8 @@
 #include "hardware/adc.h"
 
 // Inclusão dos módulos
-#include "inc/button/button.h"
-#include "inc/buzzer/buzzer.h"
 #include "inc/display/ssd1306.h"
 #include "inc/i2c_protocol/i2c_protocol.h"
-#include "inc/led_rgb/led.h"
 #include "inc/sensors/aht20.h"
 #include "inc/sensors/bmp280.h"
 
@@ -27,15 +24,6 @@
 #define MISO_PIN 16   // SPI0 RX
 #define CS_PIN   17   // Seleção de dispositivo
 #define RST_PIN  20   // Reset
-
-// Definição de variáveis e macros importantes para o debounce dos botões
-#define DEBOUNCE_TIME 260
-
-static volatile uint32_t last_btn_a_press = 0;
-static volatile uint32_t last_btn_b_press = 0;
-
-// Define a página que é exibida no display
-static volatile bool display_page = 0;
 
 // Definições de estrutura e variável que armazena os dados coletados pelos sensores
 typedef struct sensors_data {
@@ -111,40 +99,26 @@ void sx1276_set_frequency(uint64_t frequency_hz) {
     write_register(SPI_CHANNEL, REG_FRF_LSB, (uint8_t)(new_freq >> 0));
 }
 
+// Escreve os dados na FIFO
+void sx1276_write_fifo(spi_inst_t *spi, const uint8_t *data, uint8_t len) {
+    uint8_t addr = REG_FIFO | 0x80; // write flag
+    select_slave(CS_PIN);
+    spi_write_blocking(spi, &addr, 1);
+    if (len) spi_write_blocking(spi, (uint8_t*)data, len);
+    unselect_slave(CS_PIN);
+}
 
 // Inicializa o chip SX1276
 void sx1276_init() {
     // Reseta o dispositivo
     sx1276_reset();
 
-    // Verifica a versão do chip
-    uint8_t version = read_register(SPI_CHANNEL, REG_VERSION);
-    if (version != 0x12) {
-        printf("O chip SX1276 nao foi encontrado! Versao: 0x%02X\n", version);
-    } else {
-        printf("SX1276 OK. Versao: 0x%02X\n", version);
-    }
-
     // Coloca o chip no modo SLEEP e seleciona o modo LoRa (bit 7 = 1)
     write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_SLEEP);
-    sleep_ms(10);
+    sleep_ms(1);
 
     // Define a frequência de 915 MHz
     sx1276_set_frequency(915000000);
-
-    // Configurações do modem
-    write_register(SPI_CHANNEL, REG_MODEM_CONFIG1, 0x72); // 0b01110011
-    write_register(SPI_CHANNEL, REG_MODEM_CONFIG2, 0x77);
-    write_register(SPI_CHANNEL, REG_MODEM_CONFIG3, 0x04); // 0b00000100
-
-    // Configuração de preâmbulo igual à 8
-    write_register(SPI_CHANNEL, REG_20_PREAMBLE_MSB, 0);
-    write_register(SPI_CHANNEL, REG_21_PREAMBLE_LSB, 8);
-
-    // Define a potência (20 dBm)
-    write_register(SPI_CHANNEL, REG_PA_CONFIG, 0x8F); // PA_BOOST, max power
-    write_register(SPI_CHANNEL, REG_PA_DAC, 0x87);
-    sleep_ms(10);
 
     // Define o endereço do FIFO aonde os dados devem ser colocados
     // Para descrição detalhada do funcionamento, ler o item 4.1.2.3 - Principle of Operation
@@ -153,6 +127,51 @@ void sx1276_init() {
     // definidos para metade da memória (RegFifoRxBaseAddr=0x00 e RegFifoTxBaseAddr=0x80).
     write_register(SPI_CHANNEL, REG_FIFO_TX_BASE_ADDR, 0x00); // Indica o ponto na memória em que os dados que serão transmitidos estão armazenados
     write_register(SPI_CHANNEL, REG_FIFO_RX_BASE_ADDR, 0x00); // Indica a posição na memória em que os dados recebidos estarão armazenados
+
+    // Configuração de preâmbulo igual à 8
+    write_register(SPI_CHANNEL, REG_20_PREAMBLE_MSB, 0x00);
+    write_register(SPI_CHANNEL, REG_21_PREAMBLE_LSB, 0x08);
+
+    // Payload length = 10 bytes
+    // write_register(SPI_CHANNEL, REG_PAYLOAD_LENGTH, 0x0A);
+
+     /*
+        RegModemConfig1 (0x1D)
+        BW = 125 kHz  -> bits 7..4 = 0x07
+        CR = 4/5      -> bits 3..1 = 0x01
+        Header explícito -> bit 0 = 0
+        => 0b01110010 = 0x72
+    */
+    write_register(SPI_CHANNEL, REG_MODEM_CONFIG1, 0x72); // 0b01110010
+
+     /*
+        RegModemConfig2 (0x1E)
+        SF = 7        -> bits 7..4 = 0x07
+        TxContinuous = 0 -> bit 3 = 0
+        CRC On        -> bit 2 = 1
+        SymbTimeout bits 1..0 = 00 (default)
+        => 0b01110100 = 0x74
+    */
+    write_register(SPI_CHANNEL, REG_MODEM_CONFIG2, 0x74);
+
+     /*
+        RegModemConfig3 (0x26)
+        LowDataRateOptimize = 0 -> bit 3 = 0
+        AGC Auto On = 1         -> bit 2 = 1
+        => 0b00000100 = 0x04
+    */
+    write_register(SPI_CHANNEL, REG_MODEM_CONFIG3, 0x04);
+
+    // Configura PA_BOOST para potência máxima (20 dBm)
+    write_register(SPI_CHANNEL, REG_PA_CONFIG, 0xFF); // PA_BOOST + MaxPower + MaxOutputPower
+    write_register(SPI_CHANNEL, REG_PA_DAC,    0x87); // High power mode (20 dBm)
+
+    // Limite máximo do payload
+    write_register(SPI_CHANNEL, 0x23 /*RegMaxPayloadLength*/, 0xFF);
+
+    // Limpa todos os IRQs
+    write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
+
     // O registrador RegFifoAddrPtr deve ser inicializado com o endereço do buffer em que os dados serão escritos (w) ou lidos (r).
     // Caso seja realizada a leitura, definir o valor do RegFifoRxBaseAddr. Caso seja realizada a escrita, definir
     // o valor do registrador RegFifoTxBaseAddr.
@@ -160,13 +179,61 @@ void sx1276_init() {
     // o registrador RegFifoAddrPtr deve ser inicializado com o valor 0x00 (local a partir do qual os dados recebidos ou transmitidos)
     // estão armazenados.
     write_register(SPI_CHANNEL, REG_FIFO_ADDR_PTR, 0x00); // Indica em que endereço do FIFO deve começar a escrever os dados recebidos (TX ou RX) -> indica para qual endereço o ponteiro deve apontar
-    sleep_ms(10);
+    sleep_ms(1);
 
-    // define modo standby
-    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_STDBY);
-    sleep_ms(10);
+    // Define modo standby
+    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_STDBY);
+    sleep_ms(1);
 }
 
+// Realiza a transmissão de dados
+int sx1276_transmit(const uint8_t *data, uint8_t len, uint32_t timeout_ms) {
+    if (len == 0) return -1;
+
+    // Coloca o chip em modo de standby (necessário para realizar transmissão)
+    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_STDBY);
+    sleep_ms(10);
+
+    // Limpa todas as flags de interrupção (0b11111111)
+    // Mais informações podem ser encontradas no item 4.1.2.4 do doc do SX1276
+    write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
+
+    // Define a posição inicial do ponteiro do buffer do FIFO para o endereço inicial do TX (0x00)
+    uint8_t tx_addr = read_register(SPI_CHANNEL, REG_FIFO_TX_BASE_ADDR);
+    write_register(SPI_CHANNEL, REG_FIFO_ADDR_PTR, tx_addr);
+
+    // Escreve no FIFO
+    sx1276_write_fifo(SPI_CHANNEL, data, len);
+
+    // Define o tamanho do payload que será enviado (obrigatório para o modo com header implícito no registrador RegOpMode)
+    write_register(SPI_CHANNEL, REG_PAYLOAD_LENGTH, len);
+
+    // Inicia a transmissão
+    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_TX);
+
+    // Espera por TxDone
+    uint32_t start_ms = to_ms_since_boot(get_absolute_time());
+    while (1) {
+        uint8_t irq = read_register(SPI_CHANNEL, REG_IRQ_FLAGS);
+        if (irq & (1 << 3)) { // TxDone bit
+            // clear IRQs
+            write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
+            // go back to standby
+            write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_STDBY);
+            return 0;
+        }
+        // timeout
+        if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) > timeout_ms) {
+            // try to abort TX and clear IRQs
+            write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_STDBY);
+            write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
+            return -1;
+        }
+        sleep_ms(1);
+    }
+}
+
+// Recebe a mensagem
 uint8_t sx1276_receive(uint8_t *buffer, uint8_t max_len) {
     // Coloca o chip em modo de standby (necessário para realizar transmissão)
     write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_STDBY);
@@ -175,86 +242,39 @@ uint8_t sx1276_receive(uint8_t *buffer, uint8_t max_len) {
     // Mais informações podem ser encontradas no item 4.1.2.4 do doc do SX1276
     write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
 
+    // Define a posição inicial do ponteiro do buffer do FIFO para o endereço inicial do RX (0x00)
+    write_register(SPI_CHANNEL, REG_FIFO_ADDR_PTR, 0x00);
+
     // Ativa modo RX contínuo
-    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | 0x05);  // RX_CONTINUOUS
+    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_RX_CONTINUOS);
 
-    // Espera o pacote ser recebido (RX_DONE)
-    while ((read_register(SPI_CHANNEL, REG_IRQ_FLAGS) & (1 << 6)) == 0) {
-        tight_loop_contents();
+     // Aguarda até que RxDone seja setado
+    while ((read_register(SPI_CHANNEL, REG_IRQ_FLAGS) & 0x40) == 0) {
+        tight_loop_contents(); // função do SDK para "esperar sem travar"
     }
 
-    // Verificar se ocorreu erro (CRC) -> Flag PayloadCrcError
-    uint8_t irq_flags = read_register(SPI_CHANNEL, REG_IRQ_FLAGS);
-    if (irq_flags & (1 << 5)) {
-        write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
-        printf("Erro em pacote recebido");
-        return 0;
+    // Lê endereço do FIFO onde começa o pacote
+    uint8_t fifo_addr = read_register(SPI_CHANNEL, REG_FIFO_RX_CURRENT_ADDR);
+
+    // Define o ponteiro de leitura no FIFO
+    write_register(SPI_CHANNEL, REG_FIFO_ADDR_PTR, fifo_addr);
+
+    // Lê número de bytes recebidos
+    uint8_t payload_len = read_register(SPI_CHANNEL, REG_RX_NB_BYTES);
+
+    if (payload_len > max_len) {
+        payload_len = max_len; // evita overflow no buffer
     }
 
-    // Le o comprimento do payload
-    uint8_t num_bytes_pckt = (uint8_t)read_register(SPI_CHANNEL, REG_RX_NB_BYTES);
-    if (num_bytes_pckt > max_len) {
-        num_bytes_pckt = max_len;
-    }
-
-    // Obtém o endereço do local da memória em que o último pacote foi armazenado no FIFO
-    // Coloca o ponteiro no local da memória onde o último pacote foi armazenado no FIFO
-    uint8_t current_addr = read_register(SPI_CHANNEL, REG_FIFO_RX_CURRENT_ADDR);
-    write_register(SPI_CHANNEL, REG_FIFO_ADDR_PTR, current_addr);
-
-    // Armazena o pacote recebido na variável buffer
-    for (uint8_t i = 0; i < num_bytes_pckt; i++) {
+    // Lê os dados do FIFO
+    for (int i = 0; i < payload_len; i++) {
         buffer[i] = read_register(SPI_CHANNEL, REG_FIFO);
     }
 
-    // Limpa as flags de IRQ
-    write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
+    // Limpa o flag RxDone
+    write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0x40);
 
-    // Retorna ao modo standby (em modo RX contínuo ele não volta automáticamente)
-    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | 0x05); // RX_CONTINUOUS
-
-    printf("Foram recebidos %d bytes. \n", num_bytes_pckt);
-
-    return num_bytes_pckt;
-}
-
-
-// Realiza a transmissão de dados
-void sx1276_transmit(uint8_t *data, uint8_t len) {
-    // Coloca o chip em modo de standby (necessário para realizar transmissão)
-    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_STDBY);
-    sleep_ms(10);
-
-    // Define a posição inicial do ponteiro do buffer do FIFO para o endereço inicial do TX (0x00)
-    write_register(SPI_CHANNEL, REG_FIFO_ADDR_PTR, 0x00);
-
-    // Define o tamanho do payload que será enviado (obrigatório para o modo com header implícito no registrador RegOpMode)
-    write_register(SPI_CHANNEL, REG_PAYLOAD_LENGTH, len);
-
-    // Escreve os dados no buffer do FIFO
-    for (uint8_t i = 0; i < len; i++) {
-        write_register(SPI_CHANNEL, REG_FIFO, data[i]);
-    }
-
-    // Limpa todas as flags de interrupção (0b11111111)
-    // Mais informações podem ser encontradas no item 4.1.2.4 do doc do SX1276
-    write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
-
-    // Define o modo de transmissão (TX)
-    write_register(SPI_CHANNEL, REG_OP_MODE, MODE_LORA | MODE_TX);
-
-    // Verifica por meio do pooling se a transmissão terminou (bit TX_DONE do registrador RegIrqFlags será setado)
-    while ((read_register(SPI_CHANNEL, REG_IRQ_FLAGS) & 0x08) == 0) {
-        tight_loop_contents();
-    }
-
-    // Ao finalizar o envio dos pacotes de dados o dispositivo entre em modo standby automáticamente (pode ser visto em Data Transmission Sequence)
-
-    // Limpa as flags de interrupção
-    write_register(SPI_CHANNEL, REG_IRQ_FLAGS, 0xFF);
-
-
-    printf("Transmissão de dados realizada.\n");
+    return payload_len; // retorna o número de bytes recebidos
 }
 
 // Converte os dados do sensor de float para int
@@ -282,21 +302,6 @@ sensors_data_t decode_sensor_data(uint8_t *buffer) {
     return data;
 }
 
-// Função responsável por realizar o tratamento das interrupções geradas pelos botões
-void gpio_irq_handler(uint gpio, uint32_t events) {
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-
-    // Muda a página exibida no display
-    if (gpio == BTN_A_PIN && (current_time - last_btn_a_press > DEBOUNCE_TIME)) {
-        last_btn_a_press = current_time;
-        display_page = !display_page;
-    // Coloca o raspberry no modo de BOOTSEL
-    } else if (gpio == BTN_B_PIN && (current_time - last_btn_b_press > DEBOUNCE_TIME)) {
-        last_btn_b_press = current_time;
-        reset_usb_boot(0, 0);
-    }
-}
-
 // Definição de variáveis para operação do display
 static ssd1306_t ssd;
 static bool color = true;
@@ -321,90 +326,156 @@ int main() {
     gpio_init(RST_PIN);
     gpio_set_dir(RST_PIN, GPIO_OUT);
 
-    // Inicialização dos botões
-    // btns_init();
-
-    // gpio_set_irq_enabled_with_callback(BTN_B_PIN, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
-    // gpio_set_irq_enabled(BTN_A_PIN, GPIO_IRQ_EDGE_RISE, true);
-
-    // Inicialização do LED RGB
-    // leds_init();
-
-    //Inicialização do barramento I2C para o display
-    // i2c_setup(I2C1_SDA, I2C1_SCL);
-
     printf("Inicializando o display...\n");
-    // Inicializa o display
-    // ssd1306_setup(&ssd, WIDTH, HEIGHT, false, DISP_ADDR, I2C1_PORT);
-    // ssd1306_config(&ssd);
-    // ssd1306_send_data(&ssd);
+    //Inicializa o display
+    ssd1306_setup(&ssd, WIDTH, HEIGHT, false, DISP_ADDR, I2C1_PORT);
+    ssd1306_config(&ssd);
+    ssd1306_send_data(&ssd);
 
-    // Limpa o display. O display inicia com todos os pixels apagados.
-    // ssd1306_fill(&ssd, false);
-    // ssd1306_send_data(&ssd);
+    //Limpa o display. O display inicia com todos os pixels apagados.
+    ssd1306_fill(&ssd, !color);
+    ssd1306_send_data(&ssd);
 
-    // ssd1306_fill(&ssd, !color);
-    // ssd1306_send_data(&ssd);
+    sprintf(buffer, "Iniciando...");
+    ssd1306_draw_string(&ssd, buffer, 5, 30);
+    ssd1306_send_data(&ssd);
 
-    // sprintf(buffer, "Iniciando...");
-    // ssd1306_draw_string(&ssd, buffer, 5, 30);
-    // ssd1306_send_data(&ssd);
+    sleep_ms(2000);
 
     // Inicializa o módulo RFM95W
     sx1276_init();
 
-    // //Inicialização do barramento I2C para os sensores
-    // i2c_setup(I2C0_SDA, I2C0_SCL);
+    ssd1306_fill(&ssd, !color);
+    ssd1306_send_data(&ssd);
 
-    // // Inicializa o BMP280
-    // bmp280_setup(I2C0_PORT);
-    // struct bmp280_calib_param params;
-    // bmp280_get_calib_params(I2C0_PORT, &params);
+    char str_tmp[5];
+    char str_alt[5];
+    char str_umi[5];
+    char str_pres[5];
 
-    // // Inicializa o AHT20
-    // aht20_reset(I2C0_PORT);
-    // aht20_setup(I2C0_PORT);
-
-    printf("Tudo pronto...\n");
-
-    // ssd1306_fill(&ssd, !color);
-    // ssd1306_send_data(&ssd);
-
-    // sprintf(buffer, "Tudo Pronto");
-    // ssd1306_draw_string(&ssd, buffer, 5, 30);
-    // ssd1306_send_data(&ssd);
-
-    // ssd1306_fill(&ssd, !color);
-    // ssd1306_send_data(&ssd);
-
-    // // Estrutura para armazenar os dados do sensor
-    // AHT20_Data aht20_data;
-    // int32_t raw_temp_bmp;
-    // int32_t raw_pressure_bmp;
-
-    // char str_tmp[5];
-    // char str_alt[5];
-    // char str_umi[5];
-    // char str_pres[5];
-
-    sleep_ms(10000);
+    sleep_ms(3000);
     printf("Começando teste do receptor!\n");
 
-    uint8_t len;
+    uint8_t rx_buffer[256];
+
     while (true) {
-         // sx1276_receive bloqueia até chegar um pacote ou erro de CRC
-        len = sx1276_receive(buffer, sizeof(buffer)-1);
+        // Chama a função para receber (ela só retorna quando chegar algo)
+        int len = sx1276_receive(rx_buffer, sizeof(rx_buffer));
 
         if (len > 0) {
-            // coloca null-terminator para imprimir como string
-            buffer[len] = '\0';
-            printf("Recebido (%d bytes): %s\n", len, buffer);
-        } else {
-            printf("ERRO\n");
-            // se len == 0, houve erro de CRC — já printado internamente
-            // aqui você pode decidir re-tentar, sinalizar LED, etc.
+            printf("Recebido %d bytes: ", len);
+            for (int i = 0; i < len; i++) {
+                printf("%02X ", rx_buffer[i]); // imprime em HEX
+            }
+            printf("\n");
+
+            // Se quiser também imprimir como texto:
+            rx_buffer[len] = '\0'; // garante término de string
+            printf("Mensagem: %s\n", (char *)rx_buffer);
         }
     }
+
+    // while (1) {
+        // // Realiza leitura do AHT20
+        // aht20_read(I2C0_PORT, &aht20_data);
+        // sensors_data.humidity = aht20_data.humidity;
+
+        // // Realiza leitura do BMP280
+        // bmp280_read_raw(I2C0_PORT, &raw_temp_bmp, &raw_pressure_bmp);
+        // sensors_data.temperature = bmp280_convert_temp(raw_temp_bmp, &params);
+        // sensors_data.temperature = sensors_data.temperature / 100.0f;
+
+        // sensors_data.pressure = bmp280_convert_pressure(raw_pressure_bmp, raw_temp_bmp, &params);
+        // sensors_data.pressure = sensors_data.pressure / 100.0f;
+        // sensors_data.altitude = calculate_altitude(sensors_data.pressure * 100.0);
+
+        // // Converte o dado de float para inteiro
+        // sensors_packet_t packet = convert_to_packet(&sensors_data);
+        // uint8_t tx_buffer[sizeof(packet)];
+        // memcpy(tx_buffer, &packet, sizeof(packet));
+
+        // printf("Pressao: %.2f hPa\n", sensors_data.pressure);
+        // printf("Temperatura: %.2f C\n", sensors_data.temperature);
+        // printf("Altitude: %.2f m\n", sensors_data.altitude);
+        // printf("Umidade: %.2f %%\n", sensors_data.humidity);
+
+        // if (display_page) {
+        //     // Exibe os dados no display
+        //     sprintf(str_tmp, "%.1f ºC", sensors_data.temperature);
+        //     sprintf(str_alt, "%.0f m", sensors_data.altitude);
+        //     sprintf(str_umi, "%.1f %%", sensors_data.humidity);
+        //     sprintf(str_pres, "%.1f hPa", sensors_data.pressure);
+
+        //     //  Atualiza o conteúdo do display com animações
+        //     ssd1306_fill(&ssd, !color);
+        //     ssd1306_rect(&ssd, 2, 2, 124, 62, true, false);
+        //     ssd1306_draw_string(&ssd, "ESTACAO", 4, 6);
+        //     ssd1306_draw_string(&ssd, "LORA", 4, 14);
+        //     ssd1306_line(&ssd, 3, 23, 123, 23, true); // linha horizontal - primeira
+        //     ssd1306_line(&ssd, 51, 23, 51, 63, true); // linha vertical
+        //     ssd1306_draw_string(&ssd, "TEMP", 4, 25);
+        //     sprintf(str_tmp, "%.1fC", sensors_data.temperature);
+        //     ssd1306_draw_string(&ssd, str_tmp, 54, 25);
+        //     ssd1306_draw_string(&ssd, "UMID", 4, 35);
+        //     sprintf(str_umi, "%.1f%%", sensors_data.humidity);
+        //     ssd1306_draw_string(&ssd, str_umi, 54, 35);
+        //     ssd1306_draw_string(&ssd, "ALTI", 4, 45);
+        //     sprintf(str_alt, "%.1fm", sensors_data.altitude);
+        //     ssd1306_draw_string(&ssd, str_alt, 54, 45);
+        //     ssd1306_draw_string(&ssd, "PRES", 4, 55);
+        //     sprintf(str_pres, "%.1fhPa", sensors_data.pressure);
+        //     ssd1306_draw_string(&ssd, str_pres, 54, 55);
+        //     ssd1306_send_data(&ssd);
+        // } else {
+        //     ssd1306_fill(&ssd, !color);
+        //     ssd1306_rect(&ssd, 2, 2, 124, 62, true, false);
+        //     ssd1306_draw_string(&ssd, "ESTACAO", 4, 6);
+        //     ssd1306_draw_string(&ssd, "LORA", 4, 14);
+        //     // ssd1306_line(&ssd, 3, 23, 123, 23, true); // linha horizontal - primeira
+        //     // ssd1306_draw_string(&ssd, "IP", 4, 25);
+        //     // ssd1306_draw_string(&ssd, ip_str, 4, 33);
+        //     // ssd1306_send_data(&ssd);
+        // }
+
+        // sx1276_transmit(tx_buffer, sizeof(tx_buffer));
+
+        ///// ------------ RECEPTOR DOS SENSORES ------------------
+        // sensors_packet_t pkt;
+        // uint8_t rx_buffer[12];
+
+        // uint8_t received_len = sx1276_receive(rx_buffer, sizeof(rx_buffer));
+        // if (received_len == sizeof(rx_buffer)) {
+        //     sensors_data_t received_data = decode_sensor_data(rx_buffer);
+        //     printf("Recebido:\n");
+        //     printf("Pressao: %.2f hPa\n", received_data.pressure);
+        //     printf("Temperatura: %.2f °C\n", received_data.temperature);
+        //     printf("Umidade: %.2f %%\n", received_data.humidity);
+        //     printf("Altitude: %.2f m\n", received_data.altitude);
+        // } else {
+        //     printf("Erro\n");
+        // }
+
+        ////// --------------- EXEMPLO ----------------------------
+        // Transmissor
+        // uint8_t msg[] = "Hello, World!";
+
+        // sx1276_transmit(msg, sizeof(msg) - 1);
+
+        // sleep_ms(3000);
+
+         // Receptor
+        // Mensagens recebidas
+        // uint8_t buffer[64];
+        // uint8_t received = sx1276_receive(&buffer, sizeof(buffer));
+
+        // if (received > 0) {
+        //     printf("Mensagem recebida: ");
+        //     for (uint8_t i = 0; i < received; i++) {
+        //         putchar(buffer[i]);
+        //     }
+        //     printf("\n");
+        // }
+    // }
 
     return 0;
 }

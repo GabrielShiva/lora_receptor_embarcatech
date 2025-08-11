@@ -37,9 +37,6 @@ include_directories(
 
 add_executable(lora_project_receptor
     main.c
-    inc/button/button.c
-    inc/buzzer/buzzer.c
-    inc/led_rgb/led.c
     inc/i2c_protocol/i2c_protocol.c
     inc/display/ssd1306.c
     inc/sensors/aht20.c
@@ -57,7 +54,6 @@ pico_enable_stdio_usb(lora_project_receptor 1)
 target_link_libraries(lora_project_receptor
     pico_stdlib
     hardware_i2c
-    hardware_pwm
     hardware_adc
     hardware_spi
 )
