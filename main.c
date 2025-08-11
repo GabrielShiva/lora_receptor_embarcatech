@@ -356,11 +356,11 @@ int main() {
     sleep_ms(3000);
     printf("Começando teste do receptor!\n");
 
-    uint8_t rx_buffer[256];
+    uint8_t rx_buffer[255];
 
     while (true) {
         // Chama a função para receber (ela só retorna quando chegar algo)
-        int len = sx1276_receive(rx_buffer, sizeof(rx_buffer));
+        int len = sx1276_receive(rx_buffer, 255);
 
         if (len > 0) {
             printf("Recebido %d bytes: ", len);
